@@ -135,6 +135,48 @@
 			return;
 		}
 
+		const computeRunningTotals = (rows) => {
+			const isArchived = (row) => String(row?.archived).toLowerCase() === 'true';
+			let runningTotal = 0;
+			return rows.map((row) => {
+				const archived = isArchived(row);
+				const amountNum = Number.parseFloat(row?.amount) || 0;
+				const previous = runningTotal;
+				let depositPortion = 0;
+				let creditPortion = 0;
+				let spendSource = '';
+
+				if (!archived && amountNum > 0) {
+					const availableDeposit = Math.max(0, -previous);
+					depositPortion = Math.min(amountNum, availableDeposit);
+					creditPortion = amountNum - depositPortion;
+
+					if (depositPortion > 0 && creditPortion > 0) {
+						spendSource = 'mixed';
+					} else if (creditPortion > 0) {
+						spendSource = 'credit-limit';
+					} else if (depositPortion > 0) {
+						spendSource = 'account-deposit';
+					}
+				}
+
+				if (!archived) {
+					runningTotal = previous + amountNum;
+				}
+
+				return {
+					...row,
+					_previous: previous,
+					_runningTotal: runningTotal,
+					_depositPortion: !archived && amountNum > 0 ? depositPortion : '',
+					_creditPortion: !archived && amountNum > 0 ? creditPortion : '',
+					_spendSource: !archived && amountNum > 0 ? spendSource : '',
+				};
+			});
+		};
+
+		const paymentsWithTotals = computeRunningTotals(payments);
+
 		const formatMoney = (val) => {
 			const num = Number.parseFloat(val);
 			if (Number.isNaN(num)) return val ?? '';
@@ -188,6 +230,11 @@
 				td.appendChild(link);
 			}},
 			{ key: 'amount', label: 'amount', render: (val, _row, td) => { td.textContent = formatMoney(val); } },
+			{ key: '_previous', label: 'previous', render: (val, _row, td) => { td.textContent = formatMoney(val); } },
+			{ key: '_runningTotal', label: 'runningTotal', render: (val, _row, td) => { td.textContent = formatMoney(val); } },
+			{ key: '_spendSource', label: 'spendSource' },
+			{ key: '_depositPortion', label: 'depositPortion', render: (val, _row, td) => { td.textContent = val === '' ? '' : formatMoney(val); } },
+			{ key: '_creditPortion', label: 'creditPortion', render: (val, _row, td) => { td.textContent = val === '' ? '' : formatMoney(val); } },
 			{ key: 'tipAmount', label: 'tipAmount', render: (val, _row, td) => { td.textContent = formatMoney(val); } },
 			{ key: 'surchargeAmount', label: 'surchargeAmount', render: (val, _row, td) => { td.textContent = formatMoney(val); } },
 			{ key: 'createTime', label: 'createTime', render: (val, _row, td) => { td.textContent = formatDateTime(val); } },
@@ -216,7 +263,7 @@
 		});
 		table.appendChild(headerRow);
 
-		payments.forEach((p) => {
+		paymentsWithTotals.forEach((p) => {
 			const tr = document.createElement('tr');
 			columns.forEach(({ key, render }) => {
 				const td = document.createElement('td');
@@ -249,6 +296,8 @@
 		};
 		const totals = payments.reduce(
 			(acc, p) => {
+				const archived = String(p?.archived).toLowerCase() === 'true';
+				if (archived) return acc;
 				acc.amount += toNumber(p?.amount);
 				acc.tipAmount += toNumber(p?.tipAmount);
 				acc.surchargeAmount += toNumber(p?.surchargeAmount);
@@ -286,6 +335,20 @@
 		memosDiv.textContent = 'Loading credit memos...';
 		container.appendChild(memosDiv);
 		fetchCreditMemos(memosDiv, formatMoneyCents, formatDateTime);
+
+		const accountSummaryDiv = document.createElement('div');
+		accountSummaryDiv.id = 'oldCreditsCustomerAccount';
+		accountSummaryDiv.style.marginTop = '10px';
+		accountSummaryDiv.textContent = 'Loading customer account summary...';
+		container.appendChild(accountSummaryDiv);
+		fetchCustomerAccountSummary(accountSummaryDiv, formatMoney);
+
+		const paymentRequestsDiv = document.createElement('div');
+		paymentRequestsDiv.id = 'oldCreditsPaymentRequests';
+		paymentRequestsDiv.style.marginTop = '10px';
+		paymentRequestsDiv.textContent = 'Loading payment requests...';
+		container.appendChild(paymentRequestsDiv);
+		fetchPaymentRequests(paymentRequestsDiv, formatMoneyCents, formatDateTime);
 	};
 
 	const fetchInvoices = async (targetDiv, moneyFormatter, dateFormatter) => {
@@ -329,6 +392,74 @@
 		} catch (err) {
 			console.error('Failed to fetch credit memos', err);
 			targetDiv.textContent = `Failed to load credit memos: ${err.message}`;
+		}
+	};
+
+	const fetchPaymentRequests = async (targetDiv, moneyFormatter, dateFormatter) => {
+		const customerRef = getCustomerId();
+		if (!customerRef) {
+			targetDiv.textContent = 'Payment requests unavailable (missing customer id).';
+			return;
+		}
+
+		targetDiv.textContent = 'Loading payment requests...';
+		const url = `https://us.merchantos.com/admin/invoicing/payment-requests?customerRef=${encodeURIComponent(customerRef)}`;
+
+		try {
+			const response = await fetch(url, {
+				method: 'GET',
+				credentials: 'include',
+				headers: { Accept: 'application/json' },
+			});
+			if (!response.ok) throw new Error(`Payment requests failed: ${response.status}`);
+			const data = await response.json();
+			const requests = Array.isArray(data?.data) ? data.data : [];
+			renderPaymentRequests(targetDiv, requests, moneyFormatter, dateFormatter);
+		} catch (err) {
+			console.error('Failed to fetch payment requests', err);
+			targetDiv.textContent = `Failed to load payment requests: ${err.message}`;
+		}
+	};
+
+	const fetchCustomerAccountSummary = async (targetDiv, moneyFormatter) => {
+		const creditAccountId = getCreditAccountId();
+		if (!creditAccountId) {
+			targetDiv.textContent = 'Customer account summary unavailable (missing credit account id).';
+			return;
+		}
+
+		const creditLimitParam = window.customerCreditInfo?.creditLimit ?? '';
+		targetDiv.textContent = 'Loading customer account summary...';
+		const url = `https://us.merchantos.com/admin/invoicing/ls-customer-accounts/${encodeURIComponent(creditAccountId)}?credit_limit=${encodeURIComponent(creditLimitParam)}`;
+
+		try {
+			const response = await fetch(url, {
+				method: 'GET',
+				credentials: 'include',
+				headers: { Accept: 'application/json' },
+			});
+			if (!response.ok) throw new Error(`Customer account request failed: ${response.status}`);
+			const data = await response.json();
+			const attr = data?.attributes || {};
+			targetDiv.innerHTML = '<strong>Customer Account Summary</strong>';
+			const lines = [
+				`Credit Limit: ${moneyFormatter(attr.creditLimit)}`,
+				`Available From Credit Limit: ${moneyFormatter(attr.availableAmountFromCreditLimit)}`,
+				`Deposit Balance: ${moneyFormatter(attr.depositBalance)}`,
+				`Owing Balance: ${moneyFormatter(attr.owingBalance)}`,
+				`Overdue Balance: ${moneyFormatter(attr.overdueBalance)}`,
+				attr.currency ? `Currency: ${attr.currency}` : '',
+			].filter(Boolean);
+			const list = document.createElement('ul');
+			lines.forEach((line) => {
+				const li = document.createElement('li');
+				li.textContent = line;
+				list.appendChild(li);
+			});
+			targetDiv.appendChild(list);
+		} catch (err) {
+			console.error('Failed to fetch customer account summary', err);
+			targetDiv.textContent = `Failed to load customer account summary: ${err.message}`;
 		}
 	};
 
@@ -481,6 +612,167 @@
 
 		targetDiv.appendChild(table);
 		const toggle = addTableToggle(table, 15);
+		if (toggle) {
+			const toggleWrap = document.createElement('div');
+			toggleWrap.style.marginTop = '6px';
+			toggleWrap.appendChild(toggle);
+			targetDiv.appendChild(toggleWrap);
+		}
+	};
+
+	const renderPaymentRequests = (targetDiv, requests, moneyFormatter, dateFormatter) => {
+		targetDiv.innerHTML = '<strong>Payment Requests</strong>';
+		if (!requests.length) {
+			targetDiv.innerHTML += '<div>No payment requests found.</div>';
+			return;
+		}
+
+		const formatDiscounts = (discounts) => {
+			if (!Array.isArray(discounts) || !discounts.length) return '';
+			return discounts
+				.map((d) => {
+					const percent = typeof d?.percent === 'number' ? `${(d.percent * 100).toFixed(0)}%` : '';
+					const amount = typeof d?.totalAmount === 'number' ? moneyFormatter(d.totalAmount) : '';
+					const label = d?.name || d?.type || 'Discount';
+					return [label, percent, amount && `(${amount})`].filter(Boolean).join(' ');
+				})
+				.join('; ');
+		};
+
+		const formatFees = (fees) => {
+			if (!Array.isArray(fees) || !fees.length) return '';
+			return fees
+				.map((f) => {
+					const amount = typeof f?.totalAmount === 'number' ? moneyFormatter(f.totalAmount) : '';
+					const label = f?.name || f?.type || 'Fee';
+					return [label, amount].filter(Boolean).join(' ');
+				})
+				.join('; ');
+		};
+
+		const table = document.createElement('table');
+		table.style.width = '100%';
+		table.style.borderCollapse = 'collapse';
+
+		const headerRow = document.createElement('tr');
+		const columns = [
+			{ key: 'status', label: 'Status' },
+			{ key: 'requestedAmount', label: 'Requested', render: (val, _row, td) => { td.textContent = moneyFormatter(val); } },
+			{ key: 'currency', label: 'Currency' },
+			{ key: 'location', label: 'Location', render: (_val, row, td) => {
+				const loc = row?.location || {};
+				const parts = [loc.name, loc.email].filter(Boolean).join(' | ');
+				td.textContent = parts;
+			} },
+			{ key: 'customer', label: 'Customer', render: (_val, row, td) => {
+				const cust = row?.customer || {};
+				const name = [cust.firstName, cust.lastName].filter(Boolean).join(' ').trim();
+				const extras = [cust.email, cust.customerRef ? `Ref ${cust.customerRef}` : '', cust.creditAccountRef ? `Credit ${cust.creditAccountRef}` : '']
+					.filter(Boolean)
+					.join(' | ');
+				td.textContent = [name, extras].filter(Boolean).join(' — ');
+			} },
+			{ key: 'pricingTables', label: 'Items / Discounts / Fees', render: (_val, row, td) => {
+				const pts = Array.isArray(row?.pricingTables) ? row.pricingTables : [];
+				if (!pts.length) return;
+				const list = document.createElement('ul');
+				list.style.paddingLeft = '18px';
+				list.style.margin = '0';
+				pts.forEach((pt) => {
+					const li = document.createElement('li');
+					const summary = `${pt?.title || 'Pricing'}: Total ${moneyFormatter(pt?.totalAmount)} (Subtotal ${moneyFormatter(pt?.subtotal)}, Discounts ${moneyFormatter(pt?.discountTotal)}, Fees ${moneyFormatter(pt?.feeTotal)}, Tax ${moneyFormatter(pt?.taxTotal)})`;
+					li.textContent = summary;
+					const itemsList = document.createElement('ul');
+					itemsList.style.paddingLeft = '16px';
+					itemsList.style.margin = '4px 0 0 0';
+					const lineItems = Array.isArray(pt?.lineItems) ? pt.lineItems : [];
+					lineItems.forEach((item) => {
+						const innerLi = document.createElement('li');
+						const pieces = [];
+						pieces.push(`${item?.quantity ?? 0} x ${item?.name || 'Item'}`);
+						pieces.push(`@ ${moneyFormatter(item?.unitAmount)}`);
+						pieces.push(`= ${moneyFormatter(item?.totalAmount)}`);
+						const extras = [];
+						const discounts = formatDiscounts(item?.discounts);
+						if (discounts) extras.push(`Discounts: ${discounts}`);
+						const fees = formatFees(item?.fees);
+						if (fees) extras.push(`Fees: ${fees}`);
+						if (extras.length) pieces.push(`(${extras.join(' | ')})`);
+						innerLi.textContent = pieces.filter(Boolean).join(' ');
+						itemsList.appendChild(innerLi);
+					});
+					const tableDiscounts = formatDiscounts(pt?.discounts);
+					if (tableDiscounts) {
+						const dLi = document.createElement('li');
+						dLi.textContent = `Table Discounts: ${tableDiscounts}`;
+						itemsList.appendChild(dLi);
+					}
+					const tableFees = formatFees(pt?.fees);
+					if (tableFees) {
+						const fLi = document.createElement('li');
+						fLi.textContent = `Table Fees: ${tableFees}`;
+						itemsList.appendChild(fLi);
+					}
+					if (itemsList.childElementCount) li.appendChild(itemsList);
+					list.appendChild(li);
+				});
+				td.appendChild(list);
+			} },
+			{ key: 'payments', label: 'Payments', render: (_val, row, td) => {
+				const payments = Array.isArray(row?.payments) ? row.payments : [];
+				if (!payments.length) return;
+				const list = document.createElement('ul');
+				list.style.paddingLeft = '18px';
+				list.style.margin = '0';
+				payments.forEach((p) => {
+					const li = document.createElement('li');
+					const parts = [p?.status, moneyFormatter(p?.amount), p?.cardBrand ? `Card ${p.cardBrand}` : '', p?.last4 ? `••••${p.last4}` : '', p?.dateTaken ? dateFormatter(p.dateTaken) : '']
+						.filter(Boolean)
+						.join(' | ');
+					li.textContent = parts;
+					list.appendChild(li);
+				});
+				td.appendChild(list);
+			} },
+			{ key: 'documentRefs', label: 'Docs', render: (val, row, td) => {
+				const docs = Array.isArray(val) ? val : [];
+				const proposal = row?.proposalHash;
+				const parts = [];
+				if (docs.length) parts.push(`Refs: ${docs.join(', ')}`);
+				if (proposal) parts.push(`Proposal: ${proposal}`);
+				td.textContent = parts.join(' | ');
+			} },
+			{ key: 'createdAt', label: 'Created At', render: (val, _row, td) => { td.textContent = dateFormatter(val); } },
+		];
+		columns.forEach(({ label }) => {
+			const th = document.createElement('th');
+			th.textContent = label;
+			th.style.border = '1px solid #ccc';
+			th.style.padding = '4px 6px';
+			th.style.textAlign = 'left';
+			headerRow.appendChild(th);
+		});
+		table.appendChild(headerRow);
+
+		requests.forEach((req) => {
+			const tr = document.createElement('tr');
+			columns.forEach(({ key, render }) => {
+				const td = document.createElement('td');
+				const raw = req?.[key];
+				if (render) {
+					render(raw, req, td);
+				} else {
+					td.textContent = raw ?? '';
+				}
+				td.style.border = '1px solid #eee';
+				td.style.padding = '4px 6px';
+				tr.appendChild(td);
+			});
+			table.appendChild(tr);
+		});
+
+		targetDiv.appendChild(table);
+		const toggle = addTableToggle(table, 10);
 		if (toggle) {
 			const toggleWrap = document.createElement('div');
 			toggleWrap.style.marginTop = '6px';
